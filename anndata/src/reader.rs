@@ -95,6 +95,141 @@ fn open_file<P: AsRef<Path>>(file: P) -> Result<Box<dyn BufRead>> {
     Ok(reader)
 }
 
+/// Which column of `features.tsv` to expose as `var_names` after
+/// [`read_10x_mtx`].
+#[derive(Debug, Clone, Copy)]
+pub enum TenxVarNames {
+    /// Column 1 — Ensembl IDs. Guaranteed unique, stable across Cell
+    /// Ranger releases. Pick this when downstream code keys off IDs.
+    GeneId,
+    /// Column 2 — gene symbols. Human-readable; may contain duplicates
+    /// (resolve with the scanpy `var_names_make_unique` convention).
+    Symbol,
+}
+
+/// Read a 10x Cell Ranger output directory (`matrix.mtx.gz`,
+/// `barcodes.tsv.gz`, `features.tsv.gz`) into `output` as a cells × genes
+/// CSR matrix of `f32` UMI counts.
+///
+/// 10x stores the matrix as **features × barcodes** by convention; this
+/// reader transposes on the fly while streaming the triplets, so peak
+/// memory stays close to the final CSR rather than two copies. Gzipping
+/// is auto-detected — plain `.tsv` / `.mtx` files in the directory work
+/// the same.
+pub fn read_10x_mtx<P, O>(dir: P, output: &O, var_names: TenxVarNames) -> Result<()>
+where
+    P: AsRef<Path>,
+    O: AnnDataOp,
+{
+    let dir = dir.as_ref();
+
+    let barcodes = read_tsv_column(&dir.join("barcodes.tsv.gz"), 0)?;
+    let var_col = match var_names {
+        TenxVarNames::GeneId => 0,
+        TenxVarNames::Symbol => 1,
+    };
+    let features = read_tsv_column(&dir.join("features.tsv.gz"), var_col)?;
+    let n_cells = barcodes.len();
+    let n_genes = features.len();
+
+    let mtx_path = dir.join("matrix.mtx.gz");
+    let mut lines = open_file(&mtx_path)?.lines();
+
+    let header = loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} ended before MatrixMarket header", mtx_path.display())
+            })??;
+        if !line.starts_with('%') {
+            break line;
+        }
+    };
+    let mut parts = header.split_whitespace();
+    let n_rows: usize = next_usize(&mut parts, "matrix rows")?;
+    let n_cols: usize = next_usize(&mut parts, "matrix cols")?;
+    let nnz: usize = next_usize(&mut parts, "matrix nnz")?;
+
+    if n_rows != n_genes || n_cols != n_cells {
+        anyhow::bail!(
+            "MTX header {n_rows}x{n_cols} disagrees with features.tsv ({n_genes}) / \
+             barcodes.tsv ({n_cells})"
+        );
+    }
+
+    // Bucket triplets by column index (cell) — this transposes the matrix
+    // from features × barcodes to cells × genes without ever materializing
+    // both copies.
+    let mut per_cell: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_cells];
+    let mut seen: usize = 0;
+    for (lineno, line) in lines.enumerate() {
+        let line = line?;
+        let mut p = line.split_whitespace();
+        let row = next_usize(&mut p, "triplet row")?;
+        let col = next_usize(&mut p, "triplet col")?;
+        let val: f32 = p
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("triplet on line {} missing value", lineno + 1))?
+            .parse()?;
+        if row == 0 || row > n_genes || col == 0 || col > n_cells {
+            anyhow::bail!(
+                "triplet ({row},{col}) on line {} out of bounds for {n_genes}x{n_cells}",
+                lineno + 1
+            );
+        }
+        per_cell[col - 1].push(((row - 1) as u32, val));
+        seen += 1;
+    }
+    if seen != nnz {
+        anyhow::bail!("MTX nnz {seen} != header {nnz}");
+    }
+
+    let mut indptr = Vec::with_capacity(n_cells + 1);
+    let mut indices: Vec<usize> = Vec::with_capacity(nnz);
+    let mut data: Vec<f32> = Vec::with_capacity(nnz);
+    indptr.push(0_usize);
+    for mut row in per_cell {
+        row.sort_unstable_by_key(|(g, _)| *g);
+        for (g, v) in row {
+            indices.push(g as usize);
+            data.push(v);
+        }
+        indptr.push(data.len());
+    }
+    let csr = CsrMatrix::try_from_csr_data(n_cells, n_genes, indptr, indices, data)
+        .map_err(|e| anyhow::anyhow!("build CSR: {e}"))?;
+
+    output.set_n_obs(n_cells)?;
+    output.set_n_vars(n_genes)?;
+    output.set_x(csr)?;
+    output.set_obs_names(barcodes.into())?;
+    output.set_var_names(features.into())?;
+    Ok(())
+}
+
+fn read_tsv_column(path: &Path, col: usize) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (i, line) in open_file(path)?.lines().enumerate() {
+        let line = line?;
+        let value = line
+            .split('\t')
+            .nth(col)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{}: line {} missing column {col}", path.display(), i + 1)
+            })?
+            .to_string();
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn next_usize<'a, I: Iterator<Item = &'a str>>(iter: &mut I, what: &str) -> Result<usize> {
+    iter.next()
+        .ok_or_else(|| anyhow::anyhow!("missing {what}"))?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse {what}: {e}"))
+}
+
 /*
 // TODO: fix dataframe index
 pub fn import_csv<P>(
