@@ -136,11 +136,9 @@ where
     let mut lines = open_file(&mtx_path)?.lines();
 
     let header = loop {
-        let line = lines
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("{} ended before MatrixMarket header", mtx_path.display())
-            })??;
+        let line = lines.next().ok_or_else(|| {
+            anyhow::anyhow!("{} ended before MatrixMarket header", mtx_path.display())
+        })??;
         if !line.starts_with('%') {
             break line;
         }
