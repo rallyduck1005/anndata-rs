@@ -63,7 +63,7 @@ use super::get_backend;
     read_mtx
     read_csv
 */
-#[pyclass]
+#[pyclass(from_py_object)]
 #[repr(transparent)]
 pub struct AnnData(Box<dyn AnnDataTrait>);
 

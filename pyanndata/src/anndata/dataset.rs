@@ -51,7 +51,7 @@ use super::get_backend;
     read_dataset
     concat
 */
-#[pyclass]
+#[pyclass(from_py_object)]
 #[repr(transparent)]
 pub struct AnnDataSet(Box<dyn AnnDataSetTrait>);
 

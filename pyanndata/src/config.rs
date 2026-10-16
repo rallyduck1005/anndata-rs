@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 /// Compression algorithm for data storage
-#[pyclass(name = "Compression")]
+#[pyclass(name = "Compression", from_py_object)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PyCompression {
     inner: Compression,
